@@ -243,6 +243,70 @@ void test_transpose_round_trips() {
   }
 }
 
+
+// The blocked kernel has three distinct paths -- the 4x4 main block, the
+// leftover columns, and the leftover rows that fall back to the unblocked
+// kernel -- so the shapes below deliberately land in every combination of
+// m % 4 and n % 4, crossed with k on and off the 16-wide SDOT step. int32
+// accumulation is exact, so agreement must be bit for bit.
+void test_blocked_matches_scalar_bit_exactly() {
+  const int shapes[][3] = {
+      {4, 4, 16},   {4, 4, 17},   {8, 8, 64},    {8, 8, 63},
+      {5, 4, 16},   {4, 5, 16},   {5, 5, 17},    {7, 6, 33},
+      {3, 3, 16},   {1, 1, 16},   {2, 9, 48},    {16, 16, 128},
+      {9, 13, 100}, {12, 8, 32},  {6, 11, 65},   {32, 32, 256},
+  };
+
+  for (const auto& shape : shapes) {
+    const int m = shape[0];
+    const int n = shape[1];
+    const int k = shape[2];
+
+    const auto a_f = random_matrix(m, k, 1.0f, 4321u + static_cast<unsigned>(k));
+    const auto b_f = random_matrix(k, n, 1.0f, 8765u + static_cast<unsigned>(n));
+
+    std::vector<std::int8_t> a_q(a_f.size());
+    std::vector<std::int8_t> bt_q(b_f.size());
+    std::vector<float> b_scales(static_cast<std::size_t>(n));
+    qik::quantize_per_tensor(a_f.data(), a_q.data(), a_f.size());
+    qik::quantize_weights_per_channel(b_f.data(), bt_q.data(), b_scales.data(), k, n);
+
+    std::vector<std::int32_t> scalar(static_cast<std::size_t>(m) * n, 0);
+    std::vector<std::int32_t> blocked(static_cast<std::size_t>(m) * n, 0);
+
+    qik::gemm_int8_scalar(a_q.data(), bt_q.data(), scalar.data(), m, n, k);
+    qik::gemm_int8_neon_blocked(a_q.data(), bt_q.data(), blocked.data(), m, n, k);
+
+    for (std::size_t i = 0; i < scalar.size(); ++i) {
+      assert(scalar[i] == blocked[i]);
+    }
+  }
+}
+
+// Every output must be written exactly once. A blocking bug that skips or
+// double-visits a tile shows up as a leftover sentinel rather than as a wrong
+// number, which the equality test above would not necessarily catch.
+void test_blocked_writes_every_output() {
+  constexpr int m = 7;
+  constexpr int n = 6;
+  constexpr int k = 33;
+  constexpr std::int32_t kSentinel = 0x5EED5EED;
+
+  const auto a_f = random_matrix(m, k, 1.0f, 555u);
+  const auto b_f = random_matrix(k, n, 1.0f, 666u);
+  std::vector<std::int8_t> a_q(a_f.size());
+  std::vector<std::int8_t> bt_q(b_f.size());
+  std::vector<float> b_scales(n);
+  qik::quantize_per_tensor(a_f.data(), a_q.data(), a_f.size());
+  qik::quantize_weights_per_channel(b_f.data(), bt_q.data(), b_scales.data(), k, n);
+
+  std::vector<std::int32_t> out(static_cast<std::size_t>(m) * n, kSentinel);
+  qik::gemm_int8_neon_blocked(a_q.data(), bt_q.data(), out.data(), m, n, k);
+  for (const auto value : out) {
+    assert(value != kSentinel);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -250,6 +314,8 @@ int main() {
   test_transpose_round_trips();
   test_neon_matches_scalar_bit_exactly();
   test_fp32_neon_matches_scalar_within_tolerance();
+  test_blocked_matches_scalar_bit_exactly();
+  test_blocked_writes_every_output();
   test_quantization_round_trip_is_bounded();
   test_quantized_gemm_tracks_fp32_reference();
   test_per_channel_beats_per_tensor_on_skewed_columns();

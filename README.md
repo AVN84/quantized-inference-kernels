@@ -11,14 +11,14 @@ datatype, and how much is everything else you changed at the same time?**
 Apple M3 Pro, single threaded, no tiling, `clang++ -O3`. GOPS, higher is better.
 
 ```
-shape (m,n,k)    fp32 scalar  fp32 NEON    i8 NEON  i8 / fp32
---------------------------------------------------------------
-128,128,128            2.67      41.36     129.89      3.14x
-256,256,256            3.56      31.08     187.72      6.04x
-512,512,512            2.78      27.57     132.06      4.79x
-1,4096,4096            2.12      15.54      96.21      6.19x
-8,4096,4096            2.10      10.92     101.32      9.28x
-256,1024,1024          2.33      26.18     123.98      4.74x
+shape (m,n,k)    fp32 NEON   i8 flat i8 blocked  blk gain  vs fp32
+--------------------------------------------------------------------
+128,128,128          41.29    193.96    267.73     1.38x    6.48x
+256,256,256          30.84    187.72    270.78     1.44x    8.78x
+512,512,512          27.71    131.83    299.55     2.27x   10.81x
+1,4096,4096          10.11    111.71    112.47     1.01x   11.13x
+8,4096,4096          11.41    114.96    308.92     2.69x   27.07x
+256,1024,1024        26.25    124.57    309.11     2.48x   11.78x
 ```
 
 Reproduce with `make bench`. Raw output in `benchmarks/`.
@@ -60,6 +60,37 @@ where theory says they should.
 Stated plainly: **int8 wins twice, once on issue width and once on bandwidth,
 and which one dominates depends entirely on the shape.**
 
+
+## Register blocking
+
+The flat kernel holds one row of A against four rows of B: five vector loads
+feeding four SDOTs per 16-element step, or 0.8 multiply-accumulates per load.
+Every row of A re-streams all of B. At 4096x4096 the weight matrix is 16 MB
+against a 4 MB L2, so it crosses the memory bus once per output row and the
+kernel waits on DRAM instead of issuing arithmetic.
+
+Blocking 4 rows of A against 4 rows of B gives eight loads feeding sixteen
+SDOTs — 2.0 MACs per load, and B is fetched once per *block* of output rows.
+Sixteen accumulators plus eight operand registers is 24 of the 32 architectural
+SIMD registers; wider spills, and the spill costs more than the reuse buys.
+
+Result: **1.4x to 2.7x**, largest on the shapes that were most bandwidth-starved.
+
+**M=1 is 1.01x, and that is the point.** A single output row has no reuse to
+recover, so the blocked path falls back to the flat kernel and the two are the
+same code. Measuring 1.01x is the check that the benchmark is honest.
+
+### The benchmark bug that caught
+
+The first blocked run reported **1.73x on M=1** — for code that is byte-identical
+to what it was being compared against. The cause was ordering: the flat kernel
+ran first and paid every compulsory cache miss on a 16 MB B, and the blocked
+kernel ran second against a warm cache. The speedup was the cache, not the code.
+
+Fixed with an untimed warm-up pass before every measurement. M=1 then reports
+1.01x, as it must. A benchmark that cannot reproduce a known-zero result is not
+measuring what it claims to.
+
 ## Per-channel scaling
 
 Weights are quantized per output channel, not per tensor. The failure mode this
@@ -79,7 +110,10 @@ The strongest property available here is that int32 accumulation is **exact**,
 so the vectorized int8 kernel has no tolerance to hide behind — it must match
 the scalar definition bit for bit. The suite asserts that across twelve shapes
 chosen to straddle the 16-wide SDOT step and the 4-wide `n` blocking, so every
-tail path is exercised.
+tail path is exercised. The blocked kernel gets sixteen more shapes covering
+every combination of `m % 4` and `n % 4`, plus a sentinel test that every output
+is written exactly once — a tiling bug that skips a tile shows up as an unwritten
+value, not a wrong one.
 
 Also covered: quantization round-trip bounded by half a step, zero tensors not
 producing a zero scale, the transpose actually transposing, fp32 NEON agreeing
@@ -110,7 +144,7 @@ comparison at matched implementation effort, not a BLAS competition.
 
 ## Next
 
-- Cache blocking, which is where the remaining large-shape performance is.
+- Multi-level tiling over k, to keep a B panel resident in L2 across n blocks.
 - INT4 with packed nibbles.
 - SMMLA (`__ARM_FEATURE_MATMUL_INT8`) for 2x over SDOT on supporting cores.
 - A Metal compute port, then CUDA once there is hardware to run it on.

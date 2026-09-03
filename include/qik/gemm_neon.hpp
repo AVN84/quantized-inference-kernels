@@ -172,6 +172,124 @@ inline void gemm_int8_neon(const std::int8_t* a, const std::int8_t* bt,
   }
 }
 
+
+// int8 GEMM with 4x4 register blocking.
+//
+// The kernel above holds one row of A against four rows of B. Per 16-element
+// step that is five vector loads feeding four SDOTs -- 0.8 multiply-accumulates
+// per load. Every row of A re-streams the whole of B, so at 4096x4096 the 16 MB
+// weight matrix crosses the memory bus once per output row and the kernel
+// spends its time waiting on DRAM rather than issuing arithmetic.
+//
+// Blocking four rows of A against four rows of B at once turns that into eight
+// loads feeding sixteen SDOTs: 2.0 MACs per load, a 2.5x improvement in
+// arithmetic intensity, and B is fetched once per *block* of four output rows
+// instead of once per row. Sixteen accumulators plus eight operand registers is
+// 24 of the 32 architectural SIMD registers, which leaves the compiler enough
+// room to schedule without spilling -- go wider and it spills, and the spill
+// costs more than the extra reuse buys.
+//
+// This does nothing for M=1. A single output row has no reuse to recover, so
+// that shape stays bandwidth-bound no matter how the loop is arranged. The
+// honest claim here is a win on tall problems, not a universal one.
+inline void gemm_int8_neon_blocked(const std::int8_t* a, const std::int8_t* bt,
+                                   std::int32_t* c, int m_dim, int n_dim,
+                                   int k_dim) noexcept {
+  constexpr int kMR = 4;  // rows of A per block
+  constexpr int kNR = 4;  // rows of Bt per block
+
+  const int m_main = (m_dim / kMR) * kMR;
+  const int n_main = (n_dim / kNR) * kNR;
+
+  for (int m0 = 0; m0 < m_main; m0 += kMR) {
+    for (int n0 = 0; n0 < n_main; n0 += kNR) {
+      const std::int8_t* ap[kMR];
+      const std::int8_t* bp[kNR];
+      for (int i = 0; i < kMR; ++i) {
+        ap[i] = a + static_cast<std::size_t>(m0 + i) * k_dim;
+      }
+      for (int j = 0; j < kNR; ++j) {
+        bp[j] = bt + static_cast<std::size_t>(n0 + j) * k_dim;
+      }
+
+      int32x4_t acc[kMR][kNR];
+      for (int i = 0; i < kMR; ++i) {
+        for (int j = 0; j < kNR; ++j) {
+          acc[i][j] = vdupq_n_s32(0);
+        }
+      }
+
+      int k = 0;
+      for (; k + 16 <= k_dim; k += 16) {
+        const int8x16_t a0 = vld1q_s8(ap[0] + k);
+        const int8x16_t a1 = vld1q_s8(ap[1] + k);
+        const int8x16_t a2 = vld1q_s8(ap[2] + k);
+        const int8x16_t a3 = vld1q_s8(ap[3] + k);
+
+        const int8x16_t b0 = vld1q_s8(bp[0] + k);
+        const int8x16_t b1 = vld1q_s8(bp[1] + k);
+        const int8x16_t b2 = vld1q_s8(bp[2] + k);
+        const int8x16_t b3 = vld1q_s8(bp[3] + k);
+
+        acc[0][0] = vdotq_s32(acc[0][0], a0, b0);
+        acc[0][1] = vdotq_s32(acc[0][1], a0, b1);
+        acc[0][2] = vdotq_s32(acc[0][2], a0, b2);
+        acc[0][3] = vdotq_s32(acc[0][3], a0, b3);
+        acc[1][0] = vdotq_s32(acc[1][0], a1, b0);
+        acc[1][1] = vdotq_s32(acc[1][1], a1, b1);
+        acc[1][2] = vdotq_s32(acc[1][2], a1, b2);
+        acc[1][3] = vdotq_s32(acc[1][3], a1, b3);
+        acc[2][0] = vdotq_s32(acc[2][0], a2, b0);
+        acc[2][1] = vdotq_s32(acc[2][1], a2, b1);
+        acc[2][2] = vdotq_s32(acc[2][2], a2, b2);
+        acc[2][3] = vdotq_s32(acc[2][3], a2, b3);
+        acc[3][0] = vdotq_s32(acc[3][0], a3, b0);
+        acc[3][1] = vdotq_s32(acc[3][1], a3, b1);
+        acc[3][2] = vdotq_s32(acc[3][2], a3, b2);
+        acc[3][3] = vdotq_s32(acc[3][3], a3, b3);
+      }
+
+      for (int i = 0; i < kMR; ++i) {
+        std::int32_t* c_row = c + static_cast<std::size_t>(m0 + i) * n_dim;
+        for (int j = 0; j < kNR; ++j) {
+          std::int32_t sum = vaddvq_s32(acc[i][j]);
+          for (int kk = k; kk < k_dim; ++kk) {
+            sum += static_cast<std::int32_t>(ap[i][kk]) *
+                   static_cast<std::int32_t>(bp[j][kk]);
+          }
+          c_row[n0 + j] = sum;
+        }
+      }
+    }
+
+    // Columns past the last full 4-wide block.
+    for (int n = n_main; n < n_dim; ++n) {
+      const std::int8_t* b_row = bt + static_cast<std::size_t>(n) * k_dim;
+      for (int i = 0; i < kMR; ++i) {
+        const std::int8_t* a_row = a + static_cast<std::size_t>(m0 + i) * k_dim;
+        int32x4_t acc1 = vdupq_n_s32(0);
+        int k = 0;
+        for (; k + 16 <= k_dim; k += 16) {
+          acc1 = vdotq_s32(acc1, vld1q_s8(a_row + k), vld1q_s8(b_row + k));
+        }
+        std::int32_t sum = vaddvq_s32(acc1);
+        for (; k < k_dim; ++k) {
+          sum += static_cast<std::int32_t>(a_row[k]) *
+                 static_cast<std::int32_t>(b_row[k]);
+        }
+        c[static_cast<std::size_t>(m0 + i) * n_dim + n] = sum;
+      }
+    }
+  }
+
+  // Rows past the last full 4-row block fall back to the unblocked kernel.
+  if (m_main < m_dim) {
+    gemm_int8_neon(a + static_cast<std::size_t>(m_main) * k_dim, bt,
+                   c + static_cast<std::size_t>(m_main) * n_dim,
+                   m_dim - m_main, n_dim, k_dim);
+  }
+}
+
 #else
 
 // Portability shim so the harness builds and the tests still mean something on
@@ -180,6 +298,12 @@ inline void gemm_int8_neon(const std::int8_t* a, const std::int8_t* bt,
 inline void gemm_int8_neon(const std::int8_t* a, const std::int8_t* bt,
                            std::int32_t* c, int m_dim, int n_dim,
                            int k_dim) noexcept {
+  gemm_int8_scalar(a, bt, c, m_dim, n_dim, k_dim);
+}
+
+inline void gemm_int8_neon_blocked(const std::int8_t* a, const std::int8_t* bt,
+                                   std::int32_t* c, int m_dim, int n_dim,
+                                   int k_dim) noexcept {
   gemm_int8_scalar(a, bt, c, m_dim, n_dim, k_dim);
 }
 

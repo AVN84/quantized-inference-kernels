@@ -30,6 +30,16 @@ std::vector<float> random_matrix(int rows, int cols, std::uint32_t seed) {
   return out;
 }
 
+// Run once, untimed, before measuring. Without this the first kernel in the
+// sequence pays every compulsory cache miss on B and each later kernel reads a
+// warm cache -- at 4096x4096 that is 16 MB of weights, and it made an M=1 shape
+// appear 1.73x faster under blocking when the blocked path for M=1 falls back to
+// the identical flat kernel. The speedup was the cache, not the code.
+template <typename Fn>
+void warm_up(Fn&& fn) {
+  fn();
+}
+
 // Median of repeated runs rather than the mean. A single scheduler preemption
 // or a thermal blip skews a mean and leaves no trace; the median ignores it.
 // Reporting the best-of would be worse still -- it measures the luckiest run,
@@ -69,9 +79,9 @@ int main() {
       {1, 4096, 4096},   {8, 4096, 4096},  {256, 1024, 1024},
   };
 
-  std::printf("%-16s %10s %10s %10s %10s\n", "shape (m,n,k)", "fp32 scalar",
-              "fp32 NEON", "i8 NEON", "i8 / fp32");
-  std::printf("%s\n", std::string(62, '-').c_str());
+  std::printf("%-16s %9s %9s %9s %9s %8s\n", "shape (m,n,k)", "fp32 NEON",
+              "i8 flat", "i8 blocked", "blk gain", "vs fp32");
+  std::printf("%s\n", std::string(68, '-').c_str());
 
   std::vector<std::string> rows;
 
@@ -92,6 +102,7 @@ int main() {
     std::vector<float> c_f(static_cast<std::size_t>(shape.m) * shape.n);
     std::vector<std::int32_t> c_scalar(c_f.size());
     std::vector<std::int32_t> c_neon(c_f.size());
+    std::vector<std::int32_t> c_blk(c_f.size());
 
     // Large fp32 reference runs are slow enough that fewer repetitions still
     // give a stable median.
@@ -99,6 +110,8 @@ int main() {
                        64LL * 1024 * 1024;
     const int fp32_reps = large ? 3 : 7;
 
+    warm_up([&] { qik::gemm_fp32_reference(a_f.data(), b_f.data(), c_f.data(), shape.m,
+                                   shape.n, shape.k); });
     const double fp32_s = median_seconds(
         [&] {
           qik::gemm_fp32_reference(a_f.data(), b_f.data(), c_f.data(), shape.m,
@@ -106,6 +119,8 @@ int main() {
         },
         fp32_reps);
 
+    warm_up([&] { qik::gemm_fp32_transposed(a_f.data(), bt_f.data(), c_f.data(),
+                                    shape.m, shape.n, shape.k); });
     const double fp32t_s = median_seconds(
         [&] {
           qik::gemm_fp32_transposed(a_f.data(), bt_f.data(), c_f.data(),
@@ -113,6 +128,8 @@ int main() {
         },
         fp32_reps);
 
+    warm_up([&] { qik::gemm_fp32_neon(a_f.data(), bt_f.data(), c_f.data(), shape.m,
+                              shape.n, shape.k); });
     const double fp32n_s = median_seconds(
         [&] {
           qik::gemm_fp32_neon(a_f.data(), bt_f.data(), c_f.data(), shape.m,
@@ -120,6 +137,8 @@ int main() {
         },
         11);
 
+    warm_up([&] { qik::gemm_int8_scalar(a_q.data(), bt_q.data(), c_scalar.data(),
+                                shape.m, shape.n, shape.k); });
     const double scalar_s = median_seconds(
         [&] {
           qik::gemm_int8_scalar(a_q.data(), bt_q.data(), c_scalar.data(),
@@ -127,6 +146,8 @@ int main() {
         },
         fp32_reps);
 
+    warm_up([&] { qik::gemm_int8_neon(a_q.data(), bt_q.data(), c_neon.data(), shape.m,
+                              shape.n, shape.k); });
     const double neon_s = median_seconds(
         [&] {
           qik::gemm_int8_neon(a_q.data(), bt_q.data(), c_neon.data(), shape.m,
@@ -134,9 +155,18 @@ int main() {
         },
         11);
 
+    warm_up([&] { qik::gemm_int8_neon_blocked(a_q.data(), bt_q.data(), c_blk.data(),
+                                      shape.m, shape.n, shape.k); });
+    const double blk_s = median_seconds(
+        [&] {
+          qik::gemm_int8_neon_blocked(a_q.data(), bt_q.data(), c_blk.data(),
+                                      shape.m, shape.n, shape.k);
+        },
+        11);
+
     // Never report a number without checking the kernel was still correct.
     for (std::size_t i = 0; i < c_scalar.size(); ++i) {
-      if (c_scalar[i] != c_neon[i]) {
+      if (c_scalar[i] != c_neon[i] || c_scalar[i] != c_blk[i]) {
         std::fprintf(stderr, "MISMATCH at %zu -- refusing to report timings\n", i);
         return 1;
       }
@@ -144,17 +174,19 @@ int main() {
 
     char label[64];
     std::snprintf(label, sizeof(label), "%d,%d,%d", shape.m, shape.n, shape.k);
-    std::printf("%-16s %10.2f %10.2f %10.2f %9.2fx\n", label,
-                gops(shape, fp32t_s), gops(shape, fp32n_s),
-                gops(shape, neon_s), fp32n_s / neon_s);
+    std::printf("%-16s %9.2f %9.2f %9.2f %8.2fx %7.2fx\n", label,
+                gops(shape, fp32n_s), gops(shape, neon_s), gops(shape, blk_s),
+                neon_s / blk_s, fp32n_s / blk_s);
     (void)fp32_s;
     (void)scalar_s;
+    (void)fp32t_s;
   }
 
   std::printf(
-      "\nNotes: single threaded, no tiling. All kernels share the transposed-B\n"
-      "layout and 4-wide n blocking, so the last column isolates the datatype and\n"
-      "nothing else. Theoretical ceiling is 4x: FMLA retires 4 fp32 MACs per\n"
-      "instruction, SDOT retires 16 int8 ones. Not a comparison to a tuned BLAS.\n");
+      "\nNotes: single threaded. \"i8 flat\" holds one row of A against four rows of\n"
+      "B; \"i8 blocked\" holds four against four, so B is fetched once per block of\n"
+      "output rows rather than once per row. \"blk gain\" is blocked over flat.\n"
+      "M=1 has no row reuse to recover and is expected to be flat. All kernels\n"
+      "share the transposed-B layout. Not a comparison to a tuned BLAS.\n");
   return 0;
 }
