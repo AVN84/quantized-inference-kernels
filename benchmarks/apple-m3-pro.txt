@@ -1,0 +1,13 @@
+shape (m,n,k)    fp32 scalar  fp32 NEON    i8 NEON  i8 / fp32
+--------------------------------------------------------------
+128,128,128            4.71      41.44     193.21      4.66x
+256,256,256            3.56      31.19     187.81      6.02x
+512,512,512            2.78      27.55     131.66      4.78x
+1,4096,4096            2.10      13.24     101.17      7.64x
+8,4096,4096            2.11      11.21     106.80      9.53x
+256,1024,1024          2.36      26.31     123.63      4.70x
+
+Notes: single threaded, no tiling. All kernels share the transposed-B
+layout and 4-wide n blocking, so the last column isolates the datatype and
+nothing else. Theoretical ceiling is 4x: FMLA retires 4 fp32 MACs per
+instruction, SDOT retires 16 int8 ones. Not a comparison to a tuned BLAS.
