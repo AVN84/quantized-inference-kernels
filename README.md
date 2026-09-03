@@ -16,9 +16,10 @@ shape (m,n,k)    fp32 NEON   i8 flat i8 blocked  blk gain  vs fp32
 128,128,128          41.29    193.96    267.73     1.38x    6.48x
 256,256,256          30.84    187.72    270.78     1.44x    8.78x
 512,512,512          27.71    131.83    299.55     2.27x   10.81x
-1,4096,4096          10.11    111.71    112.47     1.01x   11.13x
-8,4096,4096          11.41    114.96    308.92     2.69x   27.07x
-256,1024,1024        26.25    124.57    309.11     2.48x   11.78x
+1,4096,4096          11.15    104.34    107.16     1.03x    9.61x
+8,4096,4096          11.27    105.50    292.04     2.77x   25.91x
+256,1024,1024        26.11    123.37    306.24     2.48x   11.73x
+1024,4096,4096       11.09    108.35    306.15     2.83x   27.59x
 ```
 
 Reproduce with `make bench`. Raw output in `benchmarks/`.
@@ -142,9 +143,25 @@ Single threaded. No tiling or cache blocking. No multi-threading. Not compared
 against a tuned BLAS — Accelerate would win, and the point here is the datatype
 comparison at matched implementation effort, not a BLAS competition.
 
+### Why there is no cache-tiling pass
+
+The obvious next step looked like blocking a panel of B into L2. Before writing
+it I worked out what each benchmark shape actually costs in DRAM traffic, and
+five of the six could not have shown a difference: their entire B fits in L2, so
+re-streaming it is free because it never leaves cache. Optimizing against them
+would have measured nothing and proved nothing.
+
+The shape that does stress it is `1024,4096,4096` — 16 MB of weights against a
+4 MB L2, re-read once per block of four output rows, about **4 GB** of traffic.
+Added it, and register blocking already carries it to **306 GOPS at 2.83x**,
+right alongside the shapes whose weights fit in cache entirely.
+
+So the bandwidth problem is already solved: cutting B re-reads by 4x moved the
+kernel off the memory wall, and an L2 panel pass would be optimizing something
+that is no longer the bottleneck. Measuring first saved the work.
+
 ## Next
 
-- Multi-level tiling over k, to keep a B panel resident in L2 across n blocks.
 - INT4 with packed nibbles.
 - SMMLA (`__ARM_FEATURE_MATMUL_INT8`) for 2x over SDOT on supporting cores.
 - A Metal compute port, then CUDA once there is hardware to run it on.
