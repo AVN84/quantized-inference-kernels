@@ -92,6 +92,71 @@ Fixed with an untimed warm-up pass before every measurement. M=1 then reports
 1.01x, as it must. A benchmark that cannot reproduce a known-zero result is not
 measuring what it claims to.
 
+
+## GPU backend (Metal)
+
+The same kernel on the M3 Pro's 18 GPU cores, dispatched through Metal. Output
+is **bit-identical to the CPU kernel at every shape** — int32 accumulation is
+exact, so a GPU kernel that only "almost" matches is a broken GPU kernel, and
+the benchmark refuses to print timings if any element disagrees.
+
+```
+shape (m,n,k)      CPU blocked   GPU Metal    GPU/CPU     exact
+----------------------------------------------------------------
+64,64,64                246.72        1.32      0.01x       yes
+128,128,128             269.16        9.87      0.04x       yes
+256,256,256             270.33       92.67      0.34x       yes
+512,512,512             293.21      199.15      0.68x       yes
+1024,1024,1024          307.14      274.10      0.89x       yes
+256,1024,1024           307.27      200.28      0.65x       yes
+1024,4096,4096          311.78      297.79      0.96x       yes
+```
+
+`make metal`. Raw output in `benchmarks/apple-m3-pro-metal.txt`.
+
+### The GPU loses, and that is the finding
+
+At 64x64x64 the GPU is roughly **100x slower** than one CPU core. It closes the
+gap as problems grow and still does not clearly win at 1024x4096x4096. Two
+reasons, and neither is "GPUs are overrated":
+
+**Fixed costs dominate small problems.** Buffer creation, encoding, and
+dispatch are paid per call regardless of size. A 64x64x64 GEMM is about a
+million multiply-accumulates — less work than the dispatch costs to set up.
+There is a real crossover here and it sits far to the right of where people
+assume.
+
+**The kernel is deliberately naive.** One thread per output element, each
+re-reading a full row of A and a full row of Bt from device memory with no
+threadgroup tiling and no shared-memory reuse. It is bandwidth-bound by
+construction. The CPU kernel it is being compared against is the *optimized*
+one, with 4x4 register blocking. This is a tuned CPU kernel against an
+untuned GPU kernel, and the table should be read that way.
+
+### Two things this measurement does not do
+
+**Buffers are allocated inside the timed region.** A real inference server
+allocates once and reuses across calls; doing it per dispatch penalizes the GPU
+on every row above. That is a deliberate choice to keep the harness honest
+about what is currently implemented, not an argument that it is optimal.
+
+**Unified memory flatters these numbers.** Apple Silicon shares physical memory
+between CPU and GPU, so `MTLResourceStorageModeShared` buffers are views, not
+copies. A discrete GPU would pay a host-to-device transfer that often dominates
+a GEMM this size. Do not read this table as generalizing to CUDA.
+
+### Implementation notes worth knowing
+
+The shader is compiled **at runtime** from source rather than shipped as a
+`.metallib`. The offline `metal` compiler ships with full Xcode, not the
+Command Line Tools, so precompiling would make the repo un-buildable on a
+machine that has a working GPU and the Metal framework but no Xcode.
+
+`MTLCreateSystemDefaultDevice()` returns nil without a window server session —
+over SSH, or in a build agent — on a machine whose GPU is present and working.
+`MTLCopyAllDevices()` still enumerates it. The code tries the default and falls
+back, rather than reporting "no GPU" on hardware that has one.
+
 ## Per-channel scaling
 
 Weights are quantized per output channel, not per tensor. The failure mode this
@@ -164,4 +229,6 @@ that is no longer the bottleneck. Measuring first saved the work.
 
 - INT4 with packed nibbles.
 - SMMLA (`__ARM_FEATURE_MATMUL_INT8`) for 2x over SDOT on supporting cores.
-- A Metal compute port, then CUDA once there is hardware to run it on.
+- Threadgroup tiling in the Metal kernel, which is where the GPU gap is.
+- Buffer reuse across dispatches rather than per-call allocation.
+- CUDA on Perlmutter, once the reference and harness exist (they now do).

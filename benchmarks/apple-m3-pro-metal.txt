@@ -1,0 +1,16 @@
+GPU: Apple M3 Pro
+
+shape (m,n,k)      CPU blocked   GPU Metal    GPU/CPU     exact
+----------------------------------------------------------------
+64,64,64                246.72        2.53      0.01x       yes
+128,128,128             271.34       16.05      0.06x       yes
+256,256,256             268.62       42.29      0.16x       yes
+512,512,512             297.74       83.13      0.28x       yes
+1024,1024,1024          306.55      166.13      0.54x       yes
+256,1024,1024           309.45      181.78      0.59x       yes
+1024,4096,4096          296.90      298.74      1.01x       yes
+
+Notes: GPU timing includes buffer creation and dispatch, not shader
+compilation (done once at startup). Apple Silicon has unified memory, so
+MTLResourceStorageModeShared buffers are not copied -- a discrete GPU
+would additionally pay a host-to-device transfer this table does not show.
