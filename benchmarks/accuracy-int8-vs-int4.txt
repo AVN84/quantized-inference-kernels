@@ -1,0 +1,30 @@
+Relative error vs fp32. Lower is better. m=n=64, Gaussian inputs.
+pc = per-channel weight scales, pt = one scale for the whole matrix.
+
+       K     int8 pc    int8 pt      int4 pc    int4 pt
+--------------------------------------------------------
+      32      0.0094     0.0114       0.0954     0.1417
+     128      0.0111     0.0129       0.1170     0.1747
+     512      0.0115     0.0134       0.1391     0.1846
+    2048      0.0136     0.0150       0.1552     0.2000
+    8192      0.0148     0.0162       0.1680     0.2118
+
+Same, with one weight column scaled 1000x (the pathology
+per-channel scaling exists to prevent):
+
+       K     int8 pc    int8 pt      int4 pc    int4 pt
+--------------------------------------------------------
+     128      0.0094     0.0617       0.1001     0.1467
+     512      0.0148     0.0820       0.1329     0.1918
+    2048      0.0166     0.0770       0.1811     0.2331
+
+Skewed case again, measuring ONLY the narrow columns
+(excluding the 1000x column that inflates the denominator):
+
+       K     int8 pc    int8 pt      int4 pc    int4 pt
+--------------------------------------------------------
+     128      0.0108     1.0000       0.1166     1.0000
+     512      0.0125     1.0000       0.1352     1.0000
+    2048      0.0134     1.0000       0.1507     1.0000
+
+Weight storage per element: fp32 4.0 B, int8 1.0 B, int4 0.5 B.

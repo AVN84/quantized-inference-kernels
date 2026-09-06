@@ -8,6 +8,7 @@
 #include "qik/gemm.hpp"
 #include "qik/gemm_neon.hpp"
 #include "qik/quantize.hpp"
+#include "qik/quantize4.hpp"
 
 namespace {
 
@@ -307,6 +308,93 @@ void test_blocked_writes_every_output() {
   }
 }
 
+
+// Nibble packing fails silently if sign extension is wrong: -1 stored as 0xF
+// reads back as 15 instead of -1, and every product downstream is wrong by 16x
+// with no crash and no warning. Check the whole representable range explicitly.
+void test_int4_pack_round_trip() {
+  for (int lo = -qik::kInt4Max; lo <= qik::kInt4Max; ++lo) {
+    for (int hi = -qik::kInt4Max; hi <= qik::kInt4Max; ++hi) {
+      const std::uint8_t byte = qik::pack_pair(static_cast<std::int8_t>(lo),
+                                               static_cast<std::int8_t>(hi));
+      assert(qik::unpack_lo(byte) == lo);
+      assert(qik::unpack_hi(byte) == hi);
+    }
+  }
+  // The specific value that a naive mask gets wrong.
+  assert(qik::unpack_lo(qik::pack_pair(-1, 0)) == -1);
+  assert(qik::unpack_hi(qik::pack_pair(0, -1)) == -1);
+
+  assert(qik::packed_bytes(0) == 0);
+  assert(qik::packed_bytes(1) == 1);
+  assert(qik::packed_bytes(2) == 1);
+  assert(qik::packed_bytes(3) == 2);
+}
+
+void test_int4_quantization_is_bounded() {
+  const auto values = random_matrix(48, 48, 2.0f, 1234u);
+  std::vector<std::uint8_t> packed(qik::packed_bytes(values.size()));
+  const float scale =
+      qik::quantize_per_tensor_int4(values.data(), packed.data(), values.size());
+
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    const std::int32_t q = (i % 2 == 0) ? qik::unpack_lo(packed[i / 2])
+                                        : qik::unpack_hi(packed[i / 2]);
+    assert(q >= -qik::kInt4Max && q <= qik::kInt4Max);
+    const float restored = static_cast<float>(q) * scale;
+    // Round to nearest, so no element is off by more than half a step.
+    assert(std::abs(restored - values[i]) <= scale * 0.5f + 1e-4f);
+  }
+}
+
+// The int4 kernel must agree with a straightforward unpack-then-multiply
+// reference. Odd K matters: the final byte carries only one real nibble, and
+// reading its high half would silently add a phantom term.
+void test_int4_gemm_matches_reference() {
+  const int shapes[][3] = {
+      {1, 1, 2}, {1, 1, 3}, {3, 5, 7}, {4, 4, 16},
+      {8, 9, 33}, {5, 4, 15}, {16, 16, 64}, {7, 6, 1},
+  };
+  for (const auto& sh : shapes) {
+    const int m = sh[0], n = sh[1], k = sh[2];
+    const auto a_f = random_matrix(m, k, 1.0f, 55u + static_cast<unsigned>(k));
+    const auto b_f = random_matrix(k, n, 1.0f, 66u + static_cast<unsigned>(n));
+
+    std::vector<std::int8_t> a_q(a_f.size());
+    qik::quantize_per_tensor(a_f.data(), a_q.data(), a_f.size());
+
+    const std::size_t stride = qik::packed_bytes(static_cast<std::size_t>(k));
+    std::vector<std::uint8_t> bt(stride * static_cast<std::size_t>(n));
+    std::vector<float> scales(static_cast<std::size_t>(n));
+    qik::quantize_weights_per_channel_int4(b_f.data(), bt.data(), scales.data(), k, n);
+
+    std::vector<std::int32_t> got(static_cast<std::size_t>(m) * n);
+    qik::gemm_int4_scalar(a_q.data(), bt.data(), got.data(), m, n, k);
+
+    for (int mm = 0; mm < m; ++mm) {
+      for (int nn = 0; nn < n; ++nn) {
+        std::int32_t want = 0;
+        for (int kk = 0; kk < k; ++kk) {
+          const std::uint8_t byte = bt[static_cast<std::size_t>(nn) * stride + kk / 2];
+          const std::int32_t w = (kk % 2 == 0) ? qik::unpack_lo(byte) : qik::unpack_hi(byte);
+          want += static_cast<std::int32_t>(a_q[static_cast<std::size_t>(mm) * k + kk]) * w;
+        }
+        assert(got[static_cast<std::size_t>(mm) * n + nn] == want);
+      }
+    }
+  }
+}
+
+// int4 stores half the bytes of int8. Assert it, because a packing bug that
+// silently doubles the buffer would still pass every correctness test above.
+void test_int4_actually_halves_storage() {
+  constexpr int k = 4096, n = 64;
+  const std::size_t int8_bytes = static_cast<std::size_t>(k) * n;
+  const std::size_t int4_bytes = qik::packed_bytes(static_cast<std::size_t>(k)) *
+                                 static_cast<std::size_t>(n);
+  assert(int4_bytes * 2 == int8_bytes);
+}
+
 }  // namespace
 
 int main() {
@@ -316,6 +404,10 @@ int main() {
   test_fp32_neon_matches_scalar_within_tolerance();
   test_blocked_matches_scalar_bit_exactly();
   test_blocked_writes_every_output();
+  test_int4_pack_round_trip();
+  test_int4_quantization_is_bounded();
+  test_int4_gemm_matches_reference();
+  test_int4_actually_halves_storage();
   test_quantization_round_trip_is_bounded();
   test_quantized_gemm_tracks_fp32_reference();
   test_per_channel_beats_per_tensor_on_skewed_columns();

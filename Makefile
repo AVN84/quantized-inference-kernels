@@ -7,13 +7,14 @@ BUILD_DIR := build
 BENCH := $(BUILD_DIR)/gemm_bench
 TESTS := $(BUILD_DIR)/tests
 METAL_BENCH := $(BUILD_DIR)/metal_bench
-HEADERS := include/qik/quantize.hpp include/qik/gemm.hpp include/qik/gemm_neon.hpp
+ACCURACY := $(BUILD_DIR)/accuracy
+HEADERS := include/qik/quantize.hpp include/qik/quantize4.hpp include/qik/gemm.hpp include/qik/gemm_neon.hpp
 OBJCXXFLAGS ?= -std=c++20 -ObjC++ -fobjc-arc -O2
 METAL_LIBS := -framework Metal -framework Foundation
 
-.PHONY: all test bench metal sanitize clean
+.PHONY: all test bench metal accuracy sanitize clean
 
-all: $(BENCH) $(TESTS)
+all: $(BENCH) $(TESTS) $(ACCURACY)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -40,6 +41,12 @@ $(METAL_BENCH): src/metal_bench.cpp src/metal_gemm.mm include/qik/metal_gemm.hpp
 
 metal: $(METAL_BENCH)
 	./$(METAL_BENCH)
+
+$(ACCURACY): src/accuracy.cpp $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) src/accuracy.cpp -o $@
+
+accuracy: $(ACCURACY)
+	./$(ACCURACY)
 
 sanitize: | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) -std=c++20 -O1 -g -Wall -Wextra -Wpedantic -Werror \

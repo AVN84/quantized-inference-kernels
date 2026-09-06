@@ -157,6 +157,69 @@ over SSH, or in a build agent — on a machine whose GPU is present and working.
 `MTLCopyAllDevices()` still enumerates it. The code tries the default and falls
 back, rather than reporting "no GPU" on hardware that has one.
 
+
+## What quantization costs in accuracy
+
+Throughput says what a kernel can do. It says nothing about whether the output
+is still usable, which is what decides if the kernel ships at all. `make accuracy`
+measures relative error against fp32 across bit width, scaling policy, and
+reduction length.
+
+```
+       K     int8 pc    int8 pt      int4 pc    int4 pt
+      32      0.0094     0.0114       0.0954     0.1417
+     128      0.0111     0.0129       0.1170     0.1747
+     512      0.0115     0.0134       0.1391     0.1846
+    2048      0.0136     0.0150       0.1552     0.2000
+    8192      0.0148     0.0162       0.1680     0.2118
+```
+
+**int4 costs roughly 10x the error of int8** for half the storage. int8 sits
+near 1%, int4 near 10-17%. Error also grows with K — more terms means more
+accumulated rounding — but sublinearly, since the errors are independent enough
+to partially cancel.
+
+### The aggregate number hides a total failure
+
+With one weight column scaled 1000x, the aggregate error for per-tensor int8
+reads **0.0617 to 0.0820** — six to eight percent, which sounds like a tradeoff
+someone might accept.
+
+Measuring only the *narrow* columns, excluding the wide one:
+
+```
+       K     int8 pc    int8 pt      int4 pc    int4 pt
+     128      0.0108     1.0000       0.1166     1.0000
+     512      0.0125     1.0000       0.1352     1.0000
+    2048      0.0134     1.0000       0.1507     1.0000
+```
+
+**1.0000 is total collapse** — the narrow columns quantize to zero and those
+outputs are gone. The aggregate metric normalizes by total output magnitude, so
+the one surviving 1000x column dominates the denominator and disguises complete
+failure as a six percent inconvenience.
+
+That is the practically important result here, and it is a statement about
+evaluation rather than about quantization: **an aggregate error metric can report
+a healthy number while a subset of outputs is entirely destroyed.** Anyone
+choosing a quantization scheme on a single averaged figure can ship this bug.
+
+Per-channel scaling fixes it at both widths — 0.013 for int8, 0.15 for int4 —
+at a cost of one float per output channel.
+
+### Packing
+
+int4 stores two values per byte, so weights are half of int8 and an eighth of
+fp32. The range is [-7, 7] rather than [-8, 7]: two's complement gives four bits
+an asymmetric range, and using the extra negative slot would mean negating a
+representable value could leave the representable set. One level is worth the
+symmetry.
+
+Sign extension is the failure mode that hides. A nibble of `0xF` masked without
+sign extension reads as 15 instead of -1, and every downstream product is wrong
+by 16x with no crash and no warning. The test suite round-trips all 225
+combinations of the representable range rather than sampling.
+
 ## Per-channel scaling
 
 Weights are quantized per output channel, not per tensor. The failure mode this
@@ -194,7 +257,9 @@ report numbers if they disagree.
 
 ```
 make test       # correctness
-make bench      # benchmark table
+make bench      # CPU benchmark table
+make metal      # GPU benchmark (macOS)
+make accuracy   # error vs fp32 by bit width and scaling policy
 make sanitize   # ASan + UBSan
 ```
 
@@ -227,7 +292,6 @@ that is no longer the bottleneck. Measuring first saved the work.
 
 ## Next
 
-- INT4 with packed nibbles.
 - SMMLA (`__ARM_FEATURE_MATMUL_INT8`) for 2x over SDOT on supporting cores.
 - Threadgroup tiling in the Metal kernel, which is where the GPU gap is.
 - Buffer reuse across dispatches rather than per-call allocation.
