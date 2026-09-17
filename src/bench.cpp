@@ -8,6 +8,7 @@
 
 #include "qik/gemm.hpp"
 #include "qik/gemm_neon.hpp"
+#include "qik/gemm_smmla.hpp"
 #include "qik/quantize.hpp"
 
 namespace {
@@ -86,9 +87,11 @@ int main() {
       {1024, 4096, 4096},
   };
 
-  std::printf("%-16s %9s %9s %9s %9s %8s\n", "shape (m,n,k)", "fp32 NEON",
-              "i8 flat", "i8 blocked", "blk gain", "vs fp32");
-  std::printf("%s\n", std::string(68, '-').c_str());
+  std::printf("SMMLA: %s\n\n",
+              qik::kHasNeonMatmulInt8 ? "available" : "not built in");
+  std::printf("%-16s %9s %9s %9s %9s %8s %8s\n", "shape (m,n,k)", "fp32 NEON",
+              "i8 flat", "i8 blocked", "i8 smmla", "vs blk", "vs fp32");
+  std::printf("%s\n", std::string(80, '-').c_str());
 
   std::vector<std::string> rows;
 
@@ -110,6 +113,7 @@ int main() {
     std::vector<std::int32_t> c_scalar(c_f.size());
     std::vector<std::int32_t> c_neon(c_f.size());
     std::vector<std::int32_t> c_blk(c_f.size());
+    std::vector<std::int32_t> c_smmla(c_f.size());
 
     // Large fp32 reference runs are slow enough that fewer repetitions still
     // give a stable median.
@@ -151,9 +155,27 @@ int main() {
         },
         reps);
 
+    // SMMLA retires 32 multiply-accumulates per instruction against SDOT's 16,
+    // from the same eight loads over the same 4x4 output block. Only the
+    // instruction differs, so the ratio below is the instruction's contribution
+    // and not a blocking change wearing its clothes.
+    double smmla_s = 0.0;
+    if (qik::kHasNeonMatmulInt8) {
+      warm_up([&] { qik::gemm_int8_neon_smmla(a_q.data(), bt_q.data(),
+                                              c_smmla.data(), shape.m, shape.n,
+                                              shape.k); });
+      smmla_s = median_seconds(
+          [&] {
+            qik::gemm_int8_neon_smmla(a_q.data(), bt_q.data(), c_smmla.data(),
+                                      shape.m, shape.n, shape.k);
+          },
+          reps);
+    }
+
     // Never report a number without checking the kernel was still correct.
     for (std::size_t i = 0; i < c_scalar.size(); ++i) {
-      if (c_scalar[i] != c_neon[i] || c_scalar[i] != c_blk[i]) {
+      if (c_scalar[i] != c_neon[i] || c_scalar[i] != c_blk[i] ||
+          (qik::kHasNeonMatmulInt8 && c_scalar[i] != c_smmla[i])) {
         std::fprintf(stderr, "MISMATCH at %zu -- refusing to report timings\n", i);
         return 1;
       }
@@ -161,15 +183,23 @@ int main() {
 
     char label[64];
     std::snprintf(label, sizeof(label), "%d,%d,%d", shape.m, shape.n, shape.k);
-    std::printf("%-16s %9.2f %9.2f %9.2f %8.2fx %7.2fx\n", label,
-                gops(shape, fp32n_s), gops(shape, neon_s), gops(shape, blk_s),
-                neon_s / blk_s, fp32n_s / blk_s);
+    if (qik::kHasNeonMatmulInt8) {
+      std::printf("%-16s %9.2f %9.2f %9.2f %9.2f %7.2fx %7.2fx\n", label,
+                  gops(shape, fp32n_s), gops(shape, neon_s), gops(shape, blk_s),
+                  gops(shape, smmla_s), blk_s / smmla_s, fp32n_s / smmla_s);
+    } else {
+      std::printf("%-16s %9.2f %9.2f %9.2f %9s %8s %7.2fx\n", label,
+                  gops(shape, fp32n_s), gops(shape, neon_s), gops(shape, blk_s),
+                  "n/a", "n/a", fp32n_s / blk_s);
+    }
   }
 
   std::printf(
       "\nNotes: single threaded. \"i8 flat\" holds one row of A against four rows of\n"
       "B; \"i8 blocked\" holds four against four, so B is fetched once per block of\n"
-      "output rows rather than once per row. \"blk gain\" is blocked over flat.\n"
+      "output rows rather than once per row. \"i8 smmla\" is that same 4x4 block with\n"
+      "SMMLA in place of SDOT -- 32 multiply-accumulates per instruction instead of\n"
+      "16, from the same eight loads. \"vs blk\" isolates the instruction change.\n"
       "M=1 has no row reuse to recover and is expected to be flat. All kernels\n"
       "share the transposed-B layout. Not a comparison to a tuned BLAS.\n");
   return 0;

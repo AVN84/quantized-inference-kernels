@@ -7,6 +7,7 @@
 
 #include "qik/gemm.hpp"
 #include "qik/gemm_neon.hpp"
+#include "qik/gemm_smmla.hpp"
 #include "qik/quantize.hpp"
 #include "qik/quantize4.hpp"
 
@@ -309,6 +310,114 @@ void test_blocked_writes_every_output() {
 }
 
 
+// SMMLA has one failure mode the SDOT kernels do not: the instruction reads
+// its operands as 2x8 matrices, so a wrong vcombine or a wrong lane extraction
+// transposes a 2x2 tile of the output. That produces plausible-looking numbers
+// in the wrong places, which no tolerance-based check would catch -- but int32
+// accumulation is exact, so bit equality against the scalar kernel does.
+//
+// The k values below are chosen against the three k paths: the 16-wide main
+// loop, the single 8-wide cleanup step that runs when k % 16 >= 8, and the
+// scalar remainder. k % 16 of 0, 7, 8, 9, and 15 covers all of them, crossed
+// with every combination of m % 4 and n % 4 for the block remainders.
+void test_smmla_matches_scalar_bit_exactly() {
+  const int shapes[][3] = {
+      {4, 4, 16},   {4, 4, 8},    {4, 4, 24},   {4, 4, 23},
+      {4, 4, 25},   {4, 4, 7},    {4, 4, 31},   {8, 8, 64},
+      {5, 4, 16},   {4, 5, 16},   {5, 5, 17},   {7, 6, 33},
+      {3, 3, 16},   {1, 1, 16},   {2, 9, 48},   {16, 16, 128},
+      {9, 13, 100}, {12, 8, 32},  {6, 11, 65},  {32, 32, 256},
+      {4, 4, 40},   {8, 4, 9},    {4, 8, 15},   {13, 7, 72},
+  };
+
+  for (const auto& shape : shapes) {
+    const int m = shape[0];
+    const int n = shape[1];
+    const int k = shape[2];
+
+    const auto a_f = random_matrix(m, k, 1.0f, 1357u + static_cast<unsigned>(k));
+    const auto b_f = random_matrix(k, n, 1.0f, 2468u + static_cast<unsigned>(n));
+
+    std::vector<std::int8_t> a_q(a_f.size());
+    std::vector<std::int8_t> bt_q(b_f.size());
+    std::vector<float> b_scales(static_cast<std::size_t>(n));
+    qik::quantize_per_tensor(a_f.data(), a_q.data(), a_f.size());
+    qik::quantize_weights_per_channel(b_f.data(), bt_q.data(), b_scales.data(), k, n);
+
+    std::vector<std::int32_t> scalar(static_cast<std::size_t>(m) * n, 0);
+    std::vector<std::int32_t> smmla(static_cast<std::size_t>(m) * n, 0);
+
+    qik::gemm_int8_scalar(a_q.data(), bt_q.data(), scalar.data(), m, n, k);
+    qik::gemm_int8_neon_smmla(a_q.data(), bt_q.data(), smmla.data(), m, n, k);
+
+    for (std::size_t i = 0; i < scalar.size(); ++i) {
+      assert(scalar[i] == smmla[i]);
+    }
+  }
+}
+
+// An asymmetric block, so a transposed 2x2 tile cannot coincidentally agree.
+// Every value in the 4x4 region is distinct and the expected result is
+// computed the long way, independent of any kernel.
+void test_smmla_tile_orientation() {
+  constexpr int m = 4;
+  constexpr int n = 4;
+  constexpr int k = 16;
+
+  std::vector<std::int8_t> a(static_cast<std::size_t>(m) * k);
+  std::vector<std::int8_t> bt(static_cast<std::size_t>(n) * k);
+  for (int i = 0; i < m; ++i) {
+    for (int j = 0; j < k; ++j) {
+      a[static_cast<std::size_t>(i) * k + j] =
+          static_cast<std::int8_t>(1 + i * 3 + j);
+    }
+  }
+  for (int i = 0; i < n; ++i) {
+    for (int j = 0; j < k; ++j) {
+      bt[static_cast<std::size_t>(i) * k + j] =
+          static_cast<std::int8_t>(2 + i * 5 - j);
+    }
+  }
+
+  std::vector<std::int32_t> got(static_cast<std::size_t>(m) * n, 0);
+  qik::gemm_int8_neon_smmla(a.data(), bt.data(), got.data(), m, n, k);
+
+  for (int i = 0; i < m; ++i) {
+    for (int j = 0; j < n; ++j) {
+      std::int32_t want = 0;
+      for (int kk = 0; kk < k; ++kk) {
+        want += static_cast<std::int32_t>(a[static_cast<std::size_t>(i) * k + kk]) *
+                static_cast<std::int32_t>(bt[static_cast<std::size_t>(j) * k + kk]);
+      }
+      assert(got[static_cast<std::size_t>(i) * n + j] == want);
+    }
+  }
+}
+
+// Same sentinel discipline as the blocked kernel: a tiling bug that skips a
+// 2x2 tile leaves an unwritten value rather than a wrong one.
+void test_smmla_writes_every_output() {
+  constexpr int m = 9;
+  constexpr int n = 7;
+  constexpr int k = 41;
+  constexpr std::int32_t kSentinel = 0x5EED5EED;
+
+  const auto a_f = random_matrix(m, k, 1.0f, 777u);
+  const auto b_f = random_matrix(k, n, 1.0f, 888u);
+  std::vector<std::int8_t> a_q(a_f.size());
+  std::vector<std::int8_t> bt_q(b_f.size());
+  std::vector<float> b_scales(n);
+  qik::quantize_per_tensor(a_f.data(), a_q.data(), a_f.size());
+  qik::quantize_weights_per_channel(b_f.data(), bt_q.data(), b_scales.data(), k, n);
+
+  std::vector<std::int32_t> out(static_cast<std::size_t>(m) * n, kSentinel);
+  qik::gemm_int8_neon_smmla(a_q.data(), bt_q.data(), out.data(), m, n, k);
+  for (const auto value : out) {
+    assert(value != kSentinel);
+  }
+}
+
+
 // Nibble packing fails silently if sign extension is wrong: -1 stored as 0xF
 // reads back as 15 instead of -1, and every product downstream is wrong by 16x
 // with no crash and no warning. Check the whole representable range explicitly.
@@ -399,11 +508,15 @@ void test_int4_actually_halves_storage() {
 
 int main() {
   std::printf("SDOT available: %s\n", qik::kHasNeonDotProduct ? "yes" : "no");
+  std::printf("SMMLA available: %s\n", qik::kHasNeonMatmulInt8 ? "yes" : "no");
   test_transpose_round_trips();
   test_neon_matches_scalar_bit_exactly();
   test_fp32_neon_matches_scalar_within_tolerance();
   test_blocked_matches_scalar_bit_exactly();
   test_blocked_writes_every_output();
+  test_smmla_matches_scalar_bit_exactly();
+  test_smmla_tile_orientation();
+  test_smmla_writes_every_output();
   test_int4_pack_round_trip();
   test_int4_quantization_is_bounded();
   test_int4_gemm_matches_reference();

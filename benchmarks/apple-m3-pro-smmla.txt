@@ -1,0 +1,19 @@
+SMMLA: available
+
+shape (m,n,k)    fp32 NEON   i8 flat i8 blocked  i8 smmla   vs blk  vs fp32
+--------------------------------------------------------------------------------
+128,128,128          41.32    191.01    270.60    166.66    0.62x    4.03x
+256,256,256          30.68    185.13    269.60    150.89    0.56x    4.92x
+512,512,512          27.64    131.22    299.36    135.09    0.45x    4.89x
+1,4096,4096          16.41     81.65     91.00     91.01    1.00x    5.54x
+8,4096,4096          11.18     88.87    250.20    116.79    0.47x   10.45x
+256,1024,1024        26.42    123.29    306.57    125.71    0.41x    4.76x
+1024,4096,4096       11.28    112.34    316.42    116.10    0.37x   10.29x
+
+Notes: single threaded. "i8 flat" holds one row of A against four rows of
+B; "i8 blocked" holds four against four, so B is fetched once per block of
+output rows rather than once per row. "i8 smmla" is that same 4x4 block with
+SMMLA in place of SDOT -- 32 multiply-accumulates per instruction instead of
+16, from the same eight loads. "vs blk" isolates the instruction change.
+M=1 has no row reuse to recover and is expected to be flat. All kernels
+share the transposed-B layout. Not a comparison to a tuned BLAS.

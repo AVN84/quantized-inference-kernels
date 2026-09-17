@@ -93,6 +93,87 @@ Fixed with an untimed warm-up pass before every measurement. M=1 then reports
 measuring what it claims to.
 
 
+## SMMLA: twice the arithmetic, none of the speedup
+
+SDOT retires 16 multiply-accumulates per instruction. **SMMLA retires 32** — a
+2x8 by 8x2 matrix product rather than four independent dot products. Same
+register width, twice the work, and it is the obvious next instruction to reach
+for.
+
+It is slower. Every shape, by a lot.
+
+```
+shape (m,n,k)     i8 blocked   i8 smmla    vs blk
+--------------------------------------------------
+128,128,128           270.60     166.66     0.62x
+256,256,256           269.60     150.89     0.56x
+512,512,512           299.36     135.09     0.45x
+1,4096,4096            91.00      91.01     1.00x
+8,4096,4096           250.20     116.79     0.47x
+256,1024,1024         306.57     125.71     0.41x
+1024,4096,4096        316.42     116.10     0.37x
+```
+
+`make bench`. Raw output in `benchmarks/apple-m3-pro-smmla.txt`.
+
+### Before the kernel: the instruction was not reachable
+
+`hw.optional.arm.FEAT_I8MM` is **1** on this M3 Pro. The hardware has SMMLA.
+But clang does not define `__ARM_FEATURE_MATMUL_INT8` under `-O3` alone, and it
+does not define it under `-mcpu=apple-m3` either — while `-mcpu=apple-m2` *does*,
+on a chip that is strictly newer. Only `-march=armv8.6-a+i8mm` reliably exposes
+it.
+
+So the feature-test macro this repo already uses to gate the NEON path would
+have silently reported false forever, on hardware that supports the instruction,
+because of a gap in the compiler's CPU model. The Makefile now probes for it —
+and probes the *host* as well, since compiling SMMLA for a core without it
+produces a binary that builds cleanly and dies on SIGILL.
+
+### Why it loses
+
+Count instructions for one 4x4 output block over 16 elements of k:
+
+```
+                 loads   marshalling   MAC instructions   total
+SDOT blocked         8             0           16 SDOT       24
+SMMLA                8   8 vcombine            8 SMMLA       24
+```
+
+The MAC count halves and the total does not move.
+
+SMMLA wants each operand as a packed 2x8 matrix: lanes 0-7 one row, lanes 8-15
+the next. A and Bt are row-major with k contiguous, so two rows that are
+adjacent in the output block sit `k_dim` bytes apart in memory. Stitching them
+into one register costs a `vcombine` per operand pair per step — and that is
+exactly the instruction budget the wider MAC just freed up.
+
+**The 2x is real in the ISA and zero at the call site.** Not because the
+instruction underdelivers, but because this kernel hands it operands in a layout
+it cannot use, and pays to convert on every iteration of the innermost loop.
+
+The fix is not a better inner loop, it is a **packing pass**: interleave A and Bt
+into SMMLA's 2x8 layout once, outside the k loop, and amortize the marshalling
+across every step that reads it. That is how production SMMLA kernels are
+structured, and it is a different piece of work than swapping an intrinsic.
+
+### The M=1 row is the check, again
+
+M=1 reports **1.00x**, not 0.99 or 1.02. A single output row has no 4-row block,
+so both kernels fall back to the same flat SDOT path — literally the same code.
+As with the register-blocking measurement, a benchmark that cannot reproduce a
+known-zero result is not measuring what it claims to.
+
+### What this does not say
+
+It does not say SMMLA is useless, and it does not generalize past this layout.
+It says that on a row-major kernel with no packing stage, the instruction's
+advantage is fully consumed by operand marshalling — which is an argument for
+building the packing stage, not for avoiding the instruction. The kernel is
+kept in the tree, correct and bit-exact, as the baseline that the packed version
+has to beat.
+
+
 ## GPU backend (Metal)
 
 The same kernel on the M3 Pro's 18 GPU cores, dispatched through Metal. Output
@@ -292,7 +373,9 @@ that is no longer the bottleneck. Measuring first saved the work.
 
 ## Next
 
-- SMMLA (`__ARM_FEATURE_MATMUL_INT8`) for 2x over SDOT on supporting cores.
+- A packing pass that materializes A and Bt in SMMLA's 2x8 layout once, so the
+  marshalling is amortized instead of paid per k step. That is the experiment
+  the SMMLA section above sets up and does not run.
 - Threadgroup tiling in the Metal kernel, which is where the GPU gap is.
 - Buffer reuse across dispatches rather than per-call allocation.
 - CUDA on Perlmutter, once the reference and harness exist (they now do).
