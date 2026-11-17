@@ -1,381 +1,77 @@
 # Quantized Inference Kernels
 
-int8 GEMM kernels for ARM NEON, with a fp32 baseline built to be a fair
-opponent rather than an easy one.
+Single-threaded ARM NEON int8 GEMM kernels, int4 weight packing, and a Metal
+reference backend. The CPU kernels use the same transposed-B layout as a
+hand-vectorized fp32 baseline.
 
-The question this repo answers: **how much of int8's reputation for speed is the
-datatype, and how much is everything else you changed at the same time?**
+## Implemented
 
-## Results
+- Flat SDOT and 4-by-4 register-blocked int8 GEMM.
+- An experimental SMMLA path, retained for comparison.
+- Per-channel and per-tensor quantization, including int4 packing.
+- A Metal backend with exact int32 output checks against the CPU reference.
+- Correctness, tail-shape, quantization-error, and sanitizer checks.
 
-Apple M3 Pro, single threaded, no tiling, `clang++ -O3`. GOPS, higher is better.
+## Checked-in CPU results
 
-```
-shape (m,n,k)    fp32 NEON   i8 flat i8 blocked  blk gain  vs fp32
---------------------------------------------------------------------
-128,128,128          41.29    193.96    267.73     1.38x    6.48x
-256,256,256          30.84    187.72    270.78     1.44x    8.78x
-512,512,512          27.71    131.83    299.55     2.27x   10.81x
-1,4096,4096          11.15    104.34    107.16     1.03x    9.61x
-8,4096,4096          11.27    105.50    292.04     2.77x   25.91x
-256,1024,1024        26.11    123.37    306.24     2.48x   11.73x
-1024,4096,4096       11.09    108.35    306.15     2.83x   27.59x
-```
+The following is the existing record in
+[benchmarks/apple-m3-pro.txt](benchmarks/apple-m3-pro.txt), on an Apple M3 Pro.
+Values are GOPS; speedups depend on shape, memory traffic, and measurement noise.
 
-Reproduce with `make bench`. Raw output in `benchmarks/`.
+| Shape (m,n,k) | fp32 NEON | int8 flat | int8 blocked | Blocked / flat | Blocked / fp32 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128,128,128 | 41.34 | 186.07 | 267.73 | 1.44x | 6.48x |
+| 256,256,256 | 30.35 | 187.19 | 272.61 | 1.46x | 8.98x |
+| 512,512,512 | 27.34 | 131.01 | 293.10 | 2.24x | 10.72x |
+| 1,4096,4096 | 14.55 | 48.31 | 54.88 | 1.14x | 3.77x |
+| 8,4096,4096 | 11.52 | 72.35 | 292.11 | 4.04x | 25.36x |
+| 256,1024,1024 | 26.09 | 122.83 | 305.39 | 2.49x | 11.71x |
+| 1024,4096,4096 | 12.44 | 86.65 | 173.05 | 2.00x | 13.91x |
 
-## Getting the baseline honest
+This record peaks at 305.39 GOPS. The single-row case has no inter-row reuse,
+so its observed 1.14x difference should not be interpreted as a structural
+register-blocking gain. These are checked-in measurements, not a new run.
 
-The first version of this benchmark reported **149x**. That number was garbage,
-and the path to a real one is most of what the repo is about.
+## Metal results
 
-**Mistake one: the wrong memory layout.** The naive fp32 reference strides
-through `B` by `n`, missing cache on nearly every access, while the int8 kernel
-walks a transposed `B` contiguously. Comparing them measured the access pattern,
-not the datatype. Fixed by giving both kernels the same transposed layout.
+The raw [Metal record](benchmarks/apple-m3-pro-metal.txt) includes buffer
+creation and dispatch, but excludes shader compilation. It uses Apple unified
+memory; it is not a discrete-GPU or CUDA transfer benchmark.
 
-**Mistake two: unequal optimizer permissions.** With the layout fixed, fp32 came
-in at ~2 GFLOPS against int8's ~40, still an implausible 20x. The cause is that
-floating-point addition is not associative, so the compiler may not reassociate
-a fp32 reduction into vector accumulators without `-ffast-math`. int32
-accumulation *is* associative, so the scalar int8 loop auto-vectorizes for free.
-The comparison was measuring what the optimizer was allowed to do.
+| Shape (m,n,k) | CPU blocked GOPS | Metal GOPS | GPU / CPU | Exact |
+| --- | ---: | ---: | ---: | --- |
+| 64,64,64 | 246.72 | 2.53 | 0.01x | yes |
+| 128,128,128 | 271.34 | 16.05 | 0.06x | yes |
+| 256,256,256 | 268.62 | 42.29 | 0.16x | yes |
+| 512,512,512 | 297.74 | 83.13 | 0.28x | yes |
+| 1024,1024,1024 | 306.55 | 166.13 | 0.54x | yes |
+| 256,1024,1024 | 309.45 | 181.78 | 0.59x | yes |
+| 1024,4096,4096 | 296.90 | 298.74 | 1.01x | yes |
 
-Fixed by hand-vectorizing the fp32 kernel with the same four-accumulator
-structure, making the reassociation explicit on both sides.
+The naive Metal kernel is slower on smaller shapes and approximately tied on
+the largest recorded shape. This comparison does not establish the performance
+of an optimized, tiled GPU kernel.
 
-What survives is **3.1x to 9.3x**, which is a number worth defending.
+## Accuracy and limitations
 
-## Why some shapes beat the theoretical ceiling
+[Quantization-error measurements](benchmarks/accuracy-int8-vs-int4.txt) compare
+int8/int4 and per-channel/per-tensor scaling. Per-tensor scaling can zero narrow
+columns when another column has much larger magnitude; aggregate relative error
+can hide that failure.
 
-FMLA retires 4 fp32 multiply-accumulates per instruction. SDOT retires 16 int8
-ones. So the compute ceiling is 4x — and three of the six shapes exceed it.
+These are educational kernels, not a tuned BLAS replacement. The CPU comparison
+is single-threaded; the Metal implementation has no threadgroup tiling or buffer
+reuse. Results should always be paired with the exact workload and baseline.
 
-That is not an error, it is the second effect: int8 also cuts **memory traffic**
-by 4x. At `8,4096,4096` the weight matrix is 64 MB as fp32 and 16 MB as int8,
-so the fp32 kernel is bandwidth-starved while the int8 kernel still fits usable
-working sets in cache. That shape is the most memory-bound in the table and
-posts the largest win, 9.28x. The compute-bound shapes land near the 4x ceiling
-where theory says they should.
+## Build and checks
 
-Stated plainly: **int8 wins twice, once on issue width and once on bandwidth,
-and which one dominates depends entirely on the shape.**
-
-
-## Register blocking
-
-The flat kernel holds one row of A against four rows of B: five vector loads
-feeding four SDOTs per 16-element step, or 0.8 multiply-accumulates per load.
-Every row of A re-streams all of B. At 4096x4096 the weight matrix is 16 MB
-against a 4 MB L2, so it crosses the memory bus once per output row and the
-kernel waits on DRAM instead of issuing arithmetic.
-
-Blocking 4 rows of A against 4 rows of B gives eight loads feeding sixteen
-SDOTs — 2.0 MACs per load, and B is fetched once per *block* of output rows.
-Sixteen accumulators plus eight operand registers is 24 of the 32 architectural
-SIMD registers; wider spills, and the spill costs more than the reuse buys.
-
-Result: **1.4x to 2.7x**, largest on the shapes that were most bandwidth-starved.
-
-**M=1 is 1.01x, and that is the point.** A single output row has no reuse to
-recover, so the blocked path falls back to the flat kernel and the two are the
-same code. Measuring 1.01x is the check that the benchmark is honest.
-
-### The benchmark bug that caught
-
-The first blocked run reported **1.73x on M=1** — for code that is byte-identical
-to what it was being compared against. The cause was ordering: the flat kernel
-ran first and paid every compulsory cache miss on a 16 MB B, and the blocked
-kernel ran second against a warm cache. The speedup was the cache, not the code.
-
-Fixed with an untimed warm-up pass before every measurement. M=1 then reports
-1.01x, as it must. A benchmark that cannot reproduce a known-zero result is not
-measuring what it claims to.
-
-
-## SMMLA: twice the arithmetic, none of the speedup
-
-SDOT retires 16 multiply-accumulates per instruction. **SMMLA retires 32** — a
-2x8 by 8x2 matrix product rather than four independent dot products. Same
-register width, twice the work, and it is the obvious next instruction to reach
-for.
-
-It is slower. Every shape, by a lot.
-
-```
-shape (m,n,k)     i8 blocked   i8 smmla    vs blk
---------------------------------------------------
-128,128,128           270.60     166.66     0.62x
-256,256,256           269.60     150.89     0.56x
-512,512,512           299.36     135.09     0.45x
-1,4096,4096            91.00      91.01     1.00x
-8,4096,4096           250.20     116.79     0.47x
-256,1024,1024         306.57     125.71     0.41x
-1024,4096,4096        316.42     116.10     0.37x
+```sh
+make test
+make sanitize
+make bench
+make metal
+make accuracy
 ```
 
-`make bench`. Raw output in `benchmarks/apple-m3-pro-smmla.txt`.
-
-### Before the kernel: the instruction was not reachable
-
-`hw.optional.arm.FEAT_I8MM` is **1** on this M3 Pro. The hardware has SMMLA.
-But clang does not define `__ARM_FEATURE_MATMUL_INT8` under `-O3` alone, and it
-does not define it under `-mcpu=apple-m3` either — while `-mcpu=apple-m2` *does*,
-on a chip that is strictly newer. Only `-march=armv8.6-a+i8mm` reliably exposes
-it.
-
-So the feature-test macro this repo already uses to gate the NEON path would
-have silently reported false forever, on hardware that supports the instruction,
-because of a gap in the compiler's CPU model. The Makefile now probes for it —
-and probes the *host* as well, since compiling SMMLA for a core without it
-produces a binary that builds cleanly and dies on SIGILL.
-
-### Why it loses
-
-Count instructions for one 4x4 output block over 16 elements of k:
-
-```
-                 loads   marshalling   MAC instructions   total
-SDOT blocked         8             0           16 SDOT       24
-SMMLA                8   8 vcombine            8 SMMLA       24
-```
-
-The MAC count halves and the total does not move.
-
-SMMLA wants each operand as a packed 2x8 matrix: lanes 0-7 one row, lanes 8-15
-the next. A and Bt are row-major with k contiguous, so two rows that are
-adjacent in the output block sit `k_dim` bytes apart in memory. Stitching them
-into one register costs a `vcombine` per operand pair per step — and that is
-exactly the instruction budget the wider MAC just freed up.
-
-**The 2x is real in the ISA and zero at the call site.** Not because the
-instruction underdelivers, but because this kernel hands it operands in a layout
-it cannot use, and pays to convert on every iteration of the innermost loop.
-
-The fix is not a better inner loop, it is a **packing pass**: interleave A and Bt
-into SMMLA's 2x8 layout once, outside the k loop, and amortize the marshalling
-across every step that reads it. That is how production SMMLA kernels are
-structured, and it is a different piece of work than swapping an intrinsic.
-
-### The M=1 row is the check, again
-
-M=1 reports **1.00x**, not 0.99 or 1.02. A single output row has no 4-row block,
-so both kernels fall back to the same flat SDOT path — literally the same code.
-As with the register-blocking measurement, a benchmark that cannot reproduce a
-known-zero result is not measuring what it claims to.
-
-### What this does not say
-
-It does not say SMMLA is useless, and it does not generalize past this layout.
-It says that on a row-major kernel with no packing stage, the instruction's
-advantage is fully consumed by operand marshalling — which is an argument for
-building the packing stage, not for avoiding the instruction. The kernel is
-kept in the tree, correct and bit-exact, as the baseline that the packed version
-has to beat.
-
-
-## GPU backend (Metal)
-
-The same kernel on the M3 Pro's 18 GPU cores, dispatched through Metal. Output
-is **bit-identical to the CPU kernel at every shape** — int32 accumulation is
-exact, so a GPU kernel that only "almost" matches is a broken GPU kernel, and
-the benchmark refuses to print timings if any element disagrees.
-
-```
-shape (m,n,k)      CPU blocked   GPU Metal    GPU/CPU     exact
-----------------------------------------------------------------
-64,64,64                246.72        1.32      0.01x       yes
-128,128,128             269.16        9.87      0.04x       yes
-256,256,256             270.33       92.67      0.34x       yes
-512,512,512             293.21      199.15      0.68x       yes
-1024,1024,1024          307.14      274.10      0.89x       yes
-256,1024,1024           307.27      200.28      0.65x       yes
-1024,4096,4096          311.78      297.79      0.96x       yes
-```
-
-`make metal`. Raw output in `benchmarks/apple-m3-pro-metal.txt`.
-
-### The GPU loses, and that is the finding
-
-At 64x64x64 the GPU is roughly **100x slower** than one CPU core. It closes the
-gap as problems grow and still does not clearly win at 1024x4096x4096. Two
-reasons, and neither is "GPUs are overrated":
-
-**Fixed costs dominate small problems.** Buffer creation, encoding, and
-dispatch are paid per call regardless of size. A 64x64x64 GEMM is about a
-million multiply-accumulates — less work than the dispatch costs to set up.
-There is a real crossover here and it sits far to the right of where people
-assume.
-
-**The kernel is deliberately naive.** One thread per output element, each
-re-reading a full row of A and a full row of Bt from device memory with no
-threadgroup tiling and no shared-memory reuse. It is bandwidth-bound by
-construction. The CPU kernel it is being compared against is the *optimized*
-one, with 4x4 register blocking. This is a tuned CPU kernel against an
-untuned GPU kernel, and the table should be read that way.
-
-### Two things this measurement does not do
-
-**Buffers are allocated inside the timed region.** A real inference server
-allocates once and reuses across calls; doing it per dispatch penalizes the GPU
-on every row above. That is a deliberate choice to keep the harness honest
-about what is currently implemented, not an argument that it is optimal.
-
-**Unified memory flatters these numbers.** Apple Silicon shares physical memory
-between CPU and GPU, so `MTLResourceStorageModeShared` buffers are views, not
-copies. A discrete GPU would pay a host-to-device transfer that often dominates
-a GEMM this size. Do not read this table as generalizing to CUDA.
-
-### Implementation notes worth knowing
-
-The shader is compiled **at runtime** from source rather than shipped as a
-`.metallib`. The offline `metal` compiler ships with full Xcode, not the
-Command Line Tools, so precompiling would make the repo un-buildable on a
-machine that has a working GPU and the Metal framework but no Xcode.
-
-`MTLCreateSystemDefaultDevice()` returns nil without a window server session —
-over SSH, or in a build agent — on a machine whose GPU is present and working.
-`MTLCopyAllDevices()` still enumerates it. The code tries the default and falls
-back, rather than reporting "no GPU" on hardware that has one.
-
-
-## What quantization costs in accuracy
-
-Throughput says what a kernel can do. It says nothing about whether the output
-is still usable, which is what decides if the kernel ships at all. `make accuracy`
-measures relative error against fp32 across bit width, scaling policy, and
-reduction length.
-
-```
-       K     int8 pc    int8 pt      int4 pc    int4 pt
-      32      0.0094     0.0114       0.0954     0.1417
-     128      0.0111     0.0129       0.1170     0.1747
-     512      0.0115     0.0134       0.1391     0.1846
-    2048      0.0136     0.0150       0.1552     0.2000
-    8192      0.0148     0.0162       0.1680     0.2118
-```
-
-**int4 costs roughly 10x the error of int8** for half the storage. int8 sits
-near 1%, int4 near 10-17%. Error also grows with K — more terms means more
-accumulated rounding — but sublinearly, since the errors are independent enough
-to partially cancel.
-
-### The aggregate number hides a total failure
-
-With one weight column scaled 1000x, the aggregate error for per-tensor int8
-reads **0.0617 to 0.0820** — six to eight percent, which sounds like a tradeoff
-someone might accept.
-
-Measuring only the *narrow* columns, excluding the wide one:
-
-```
-       K     int8 pc    int8 pt      int4 pc    int4 pt
-     128      0.0108     1.0000       0.1166     1.0000
-     512      0.0125     1.0000       0.1352     1.0000
-    2048      0.0134     1.0000       0.1507     1.0000
-```
-
-**1.0000 is total collapse** — the narrow columns quantize to zero and those
-outputs are gone. The aggregate metric normalizes by total output magnitude, so
-the one surviving 1000x column dominates the denominator and disguises complete
-failure as a six percent inconvenience.
-
-That is the practically important result here, and it is a statement about
-evaluation rather than about quantization: **an aggregate error metric can report
-a healthy number while a subset of outputs is entirely destroyed.** Anyone
-choosing a quantization scheme on a single averaged figure can ship this bug.
-
-Per-channel scaling fixes it at both widths — 0.013 for int8, 0.15 for int4 —
-at a cost of one float per output channel.
-
-### Packing
-
-int4 stores two values per byte, so weights are half of int8 and an eighth of
-fp32. The range is [-7, 7] rather than [-8, 7]: two's complement gives four bits
-an asymmetric range, and using the extra negative slot would mean negating a
-representable value could leave the representable set. One level is worth the
-symmetry.
-
-Sign extension is the failure mode that hides. A nibble of `0xF` masked without
-sign extension reads as 15 instead of -1, and every downstream product is wrong
-by 16x with no crash and no warning. The test suite round-trips all 225
-combinations of the representable range rather than sampling.
-
-## Per-channel scaling
-
-Weights are quantized per output channel, not per tensor. The failure mode this
-avoids is one wide column setting the step size for every other column. The test
-suite builds exactly that pathology — one column scaled 1000x — and measures it:
-
-```
-per-channel error 0.0116    per-tensor error 1.0000
-```
-
-Per-tensor error of 1.0 means total loss: the narrow columns quantize to zero
-and the output is zero. Per-channel costs one float per output channel.
-
-## Correctness
-
-The strongest property available here is that int32 accumulation is **exact**,
-so the vectorized int8 kernel has no tolerance to hide behind — it must match
-the scalar definition bit for bit. The suite asserts that across twelve shapes
-chosen to straddle the 16-wide SDOT step and the 4-wide `n` blocking, so every
-tail path is exercised. The blocked kernel gets sixteen more shapes covering
-every combination of `m % 4` and `n % 4`, plus a sentinel test that every output
-is written exactly once — a tiling bug that skips a tile shows up as an unwritten
-value, not a wrong one.
-
-Also covered: quantization round-trip bounded by half a step, zero tensors not
-producing a zero scale, the transpose actually transposing, fp32 NEON agreeing
-with scalar fp32 within reassociation tolerance, end-to-end quantized GEMM
-within 5% of the fp32 reference, and the per-channel gap above.
-
-`make test` and `make sanitize` (ASan + UBSan). The benchmark re-verifies the
-kernel against the scalar version before printing any timing, and refuses to
-report numbers if they disagree.
-
-## Build
-
-```
-make test       # correctness
-make bench      # CPU benchmark table
-make metal      # GPU benchmark (macOS)
-make accuracy   # error vs fp32 by bit width and scaling policy
-make sanitize   # ASan + UBSan
-```
-
-Requires ARMv8.2 dot product (`__ARM_FEATURE_DOTPROD`). Without it the build
-still works, `kHasNeonDotProduct` reports false, and the benchmark prints a
-warning instead of quietly reporting scalar numbers as NEON.
-
-## Scope
-
-Single threaded. No tiling or cache blocking. No multi-threading. Not compared
-against a tuned BLAS — Accelerate would win, and the point here is the datatype
-comparison at matched implementation effort, not a BLAS competition.
-
-### Why there is no cache-tiling pass
-
-The obvious next step looked like blocking a panel of B into L2. Before writing
-it I worked out what each benchmark shape actually costs in DRAM traffic, and
-five of the six could not have shown a difference: their entire B fits in L2, so
-re-streaming it is free because it never leaves cache. Optimizing against them
-would have measured nothing and proved nothing.
-
-The shape that does stress it is `1024,4096,4096` — 16 MB of weights against a
-4 MB L2, re-read once per block of four output rows, about **4 GB** of traffic.
-Added it, and register blocking already carries it to **306 GOPS at 2.83x**,
-right alongside the shapes whose weights fit in cache entirely.
-
-So the bandwidth problem is already solved: cutting B re-reads by 4x moved the
-kernel off the memory wall, and an L2 panel pass would be optimizing something
-that is no longer the bottleneck. Measuring first saved the work.
-
-## Next
-
-- A packing pass that materializes A and Bt in SMMLA's 2x8 layout once, so the
-  marshalling is amortized instead of paid per k step. That is the experiment
-  the SMMLA section above sets up and does not run.
-- Threadgroup tiling in the Metal kernel, which is where the GPU gap is.
-- Buffer reuse across dispatches rather than per-call allocation.
-- CUDA on Perlmutter, once the reference and harness exist (they now do).
+The vectorized CPU path requires ARMv8.2 dot-product support; Metal requires
+macOS. See the Makefile and source for the available fallback behavior.
